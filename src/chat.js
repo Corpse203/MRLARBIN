@@ -11,22 +11,35 @@ export function startChatListener(getValidUserAccessToken) {
   let appToken = '';                   // pour WS
   let canonStreamer = CONFIG.streamerUsername; // username canonique
 
-  // Récupère la forme "canonique" du username (casse exacte)
+  // Récupère username canonique via 2 variantes : userByUsername puis fallback userByDisplayName
   const resolveCanonicalUsername = async () => {
-    try {
-      const userToken = await getValidUserAccessToken();
-      const q = `query($u:String!){ userByUsername(username:$u){ username displayname } }`;
-      const data = await postGraphQL(q, { u: CONFIG.streamerUsername }, userToken);
-      const u = data?.userByUsername?.username;
-      if (u) {
-        canonStreamer = u;
-        console.log(`[INFO] Username canonique côté DLive = ${u} (display=${data.userByUsername.displayname})`);
-      } else {
-        console.warn(`[WARN] DLive ne trouve pas "${CONFIG.streamerUsername}". Vérifie la casse/le slug exact du channel.`);
+    const run = async (query, vars, label) => {
+      const tok = await getValidUserAccessToken();
+      try {
+        const d = await postGraphQL(query, vars, tok);
+        const u = d?.userByUsername?.username ?? d?.userByDisplayName?.username;
+        const disp = d?.userByUsername?.displayname ?? d?.userByDisplayName?.displayname;
+        if (u) {
+          console.log(`[INFO] (${label}) Username API = ${u} (display=${disp})`);
+          return { u, disp };
+        }
+      } catch (e) {
+        console.warn(`[WARN] ${label} failed:`, e.message);
       }
-    } catch (e) {
-      console.warn('[WARN] resolveCanonicalUsername failed:', e.message);
-    }
+      return null;
+    };
+
+    // 1) userByUsername
+    const q1 = `query($u:String!){ userByUsername(username:$u){ username displayname } }`;
+    const r1 = await run(q1, { u: CONFIG.streamerUsername }, 'userByUsername');
+    if (r1?.u) { canonStreamer = r1.u; return; }
+
+    // 2) fallback: userByDisplayName
+    const q2 = `query($d:String!){ userByDisplayName(displayname:$d){ username displayname } }`;
+    const r2 = await run(q2, { d: CONFIG.streamerUsername }, 'userByDisplayName');
+    if (r2?.u) { canonStreamer = r2.u; return; }
+
+    console.warn(`[WARN] Impossible de résoudre le username pour "${CONFIG.streamerUsername}". On continue avec la valeur fournie.`);
   };
 
   const connect = async () => {
@@ -39,7 +52,7 @@ export function startChatListener(getValidUserAccessToken) {
       }
       await resolveCanonicalUsername();
     } catch (e) {
-      console.error('[ERR] Pré-connexion WS (app token / username):', e.message);
+      console.error('[ERR] Pré-connexion WS:', e.message);
     }
 
     // DLive WS exige le sous-protocole "graphql-ws"
@@ -55,8 +68,8 @@ export function startChatListener(getValidUserAccessToken) {
           payload: { authorization: appToken }
         }));
 
-        // Abonnement au chat (username canonique)
-        const q = `subscription {
+        // Essaye 2 variantes d'abonnement
+        const sub1 = `subscription {
           streamMessageReceived(streamer: "${canonStreamer}") {
             __typename
             type
@@ -66,8 +79,19 @@ export function startChatListener(getValidUserAccessToken) {
           }
         }`;
 
-        ws.send(JSON.stringify({ id: '1', type: 'start', payload: { query: q } }));
-        console.log('WS connected. Subscription sent for streamer =', canonStreamer);
+        const sub2 = `subscription {
+          streamChatMessage(streamer: "${canonStreamer}") {
+            __typename
+            type
+            id
+            content
+            sender { username displayname }
+          }
+        }`;
+
+        // On envoie d’abord sub1; si le serveur renvoie une erreur sur l’op id "1", on réessaie sub2 sur l’op id "2".
+        ws.send(JSON.stringify({ id: '1', type: 'start', payload: { query: sub1 } }));
+        console.log('WS connected. Subscription (v1) sent for =', canonStreamer);
       } catch (e) {
         console.error('WS init error:', e.message);
         try { ws.close(); } catch (_) {}
@@ -75,43 +99,56 @@ export function startChatListener(getValidUserAccessToken) {
     });
 
     ws.on('message', async (raw) => {
-      try {
-        const msg = JSON.parse(raw);
+      let msg;
+      try { msg = JSON.parse(raw); } catch { console.error('[WS] non-JSON:', raw?.toString?.()); return; }
 
-        // keep-alive / acks
-        if (msg.type && msg.type !== 'data') {
-          if (msg.type !== 'ka') console.log('[WS]', msg.type);
-        }
-        if (msg.type !== 'data') return;
+      // Log utile pour debug
+      if (msg.type && msg.type !== 'data' && msg.type !== 'ka') {
+        console.log('[WS]', msg.type, JSON.stringify(msg.payload || msg, null, 2).slice(0, 500));
+      }
 
-        // Normalisation en tableau
-        const node = msg?.payload?.data?.streamMessageReceived;
-        if (!node) return;
-        const events = Array.isArray(node) ? node : [node];
-
-        for (const it of events) {
-          if (it?.__typename) {
-            console.log(`Chat evt: ${it.__typename} from ${it?.sender?.username ?? 'unknown'} -> ${String(it?.content ?? '').slice(0,120)}`);
+      // Si le serveur dit "error" pour l'opération "1", on tente la variante 2
+      if (msg.type === 'error' && msg.id === '1') {
+        console.warn('[WS] Subscription v1 refused. Trying fallback v2...');
+        const sub2 = `subscription {
+          streamChatMessage(streamer: "${canonStreamer}") {
+            __typename
+            type
+            id
+            content
+            sender { username displayname }
           }
+        }`;
+        ws.send(JSON.stringify({ id: '2', type: 'start', payload: { query: sub2 } }));
+        return;
+      }
 
-          if (it.__typename === 'ChatText' && typeof it.content === 'string') {
-            const text = it.content.trim();
+      if (msg.type !== 'data') return;
 
-            // Commande !discord en début de message
-            if (/^!discord\b/i.test(text)) {
-              try {
-                // ENVOI = token UTILISATEUR (pas App token)
-                const userToken = await getValidUserAccessToken();
-                await sendChatMessage(canonStreamer, CONFIG.botReplyText, userToken);
-                console.log(`Replied to !discord with: "${CONFIG.botReplyText}"`);
-              } catch (err) {
-                console.error('Failed to send chat message:', err?.message || err);
-              }
+      // Normalise la payload en tableau
+      const root =
+        msg?.payload?.data?.streamMessageReceived ??
+        msg?.payload?.data?.streamChatMessage;
+      if (!root) return;
+
+      const events = Array.isArray(root) ? root : [root];
+      for (const it of events) {
+        if (it?.__typename) {
+          console.log(`Chat evt: ${it.__typename} from ${it?.sender?.username ?? 'unknown'} -> ${String(it?.content ?? '').slice(0,120)}`);
+        }
+
+        if (it.__typename === 'ChatText' && typeof it.content === 'string') {
+          const text = it.content.trim();
+          if (/^!discord\b/i.test(text)) {
+            try {
+              const userToken = await getValidUserAccessToken(); // ENVOI = token UTILISATEUR
+              await sendChatMessage(canonStreamer, CONFIG.botReplyText, userToken);
+              console.log(`Replied to !discord with: "${CONFIG.botReplyText}"`);
+            } catch (err) {
+              console.error('Failed to send chat message:', err?.message || err);
             }
           }
         }
-      } catch (e) {
-        console.error('WS parse/handle error:', e.message);
       }
     });
 
