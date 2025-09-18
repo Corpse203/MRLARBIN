@@ -23,24 +23,22 @@ export async function postGraphQL(query, variables, accessToken) {
 
 /**
  * Envoi d’un message dans le chat.
- * Mutation correcte = sendStreamchatMessage(input: { streamer: "...", message: "..." })
- * La réponse n’a probablement pas de champ id, donc on demande juste un booléen ok.
+ * Schéma valide observé: sendStreamchatMessage(input: { streamer, message }) renvoie un objet,
+ * mais sans champ "ok"/"id". On sélectionne "__typename" pour valider la mutation.
  */
 export async function sendChatMessage(streamerUsername, message, userAccessToken) {
   const mutation = `
     mutation($input: SendStreamchatMessageInput!) {
       sendStreamchatMessage(input: $input) {
-        ok
+        __typename
       }
     }
   `;
-
   const variables = {
     input: {
       streamer: streamerUsername,
       message: message
     }
   };
-
   return await postGraphQL(mutation, variables, userAccessToken);
 }
