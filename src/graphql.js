@@ -2,7 +2,7 @@ import axios from 'axios';
 
 const GRAPHQL_HTTP = 'https://graphigo.prd.dlive.tv/';
 
-export async function postGraphQL(query, variables, accessToken)  {
+export async function postGraphQL(query, variables, accessToken) {
   try {
     const res = await axios.post(
       GRAPHQL_HTTP,
@@ -23,54 +23,24 @@ export async function postGraphQL(query, variables, accessToken)  {
 
 /**
  * Envoi d’un message dans le chat.
- * On essaie en cascade car le schéma public peut varier :
- *  1) sendChatMessage
- *  2) sendStreamchatMessage   (comme suggéré par l’erreur du serveur)
- *  3) sendStreamMessage       (fallback historique)
+ * Mutation correcte = sendStreamchatMessage(input: { streamer: "...", message: "..." })
+ * La réponse n’a probablement pas de champ id, donc on demande juste un booléen ok.
  */
 export async function sendChatMessage(streamerUsername, message, userAccessToken) {
-  const attempts = [
-    {
-      name: 'sendChatMessage',
-      gql: `
-        mutation($streamer: String!, $message: String!) {
-          sendChatMessage(streamer: $streamer, message: $message) { id }
-        }
-      `
-    },
-    {
-      name: 'sendStreamchatMessage',
-      gql: `
-        mutation($streamer: String!, $message: String!) {
-          sendStreamchatMessage(streamer: $streamer, message: $message) { id }
-        }
-      `
-    },
-    {
-      name: 'sendStreamMessage',
-      gql: `
-        mutation($streamer: String!, $message: String!) {
-          sendStreamMessage(streamer: $streamer, message: $message) { id }
-        }
-      `
-    }
-  ];
-
-  let lastErr;
-  for (const { name, gql } of attempts) {
-    try {
-      const data = await postGraphQL(gql, { streamer: streamerUsername, message }, userAccessToken);
-      if (data) {
-        // succès sur cette variante
-        return data;
+  const mutation = `
+    mutation($input: SendStreamchatMessageInput!) {
+      sendStreamchatMessage(input: $input) {
+        ok
       }
-    } catch (e) {
-      lastErr = e;
-      // log utile côté serveur
-      console.warn(`[sendChatMessage] ${name} failed:`, e.message);
-      // on continue sur la variante suivante
     }
-  }
-  // Toutes les variantes ont échoué
-  throw lastErr || new Error('All send chat mutations failed');
+  `;
+
+  const variables = {
+    input: {
+      streamer: streamerUsername,
+      message: message
+    }
+  };
+
+  return await postGraphQL(mutation, variables, userAccessToken);
 }
