@@ -10,7 +10,8 @@ export function startChatListener(getValidUserAccessToken) {
 
   const connect = async () => {
     clearTimeout(reconnectTimer);
-    // IMPORTANT : DLive WS exige le sous-protocole "graphql-ws"
+
+    // DLive exige le sous-protocole "graphql-ws"
     ws = new WebSocket(WS_ENDPOINT, 'graphql-ws', {
       headers: { Origin: 'https://dlive.tv' }
     });
@@ -19,32 +20,28 @@ export function startChatListener(getValidUserAccessToken) {
       try {
         const userToken = await getValidUserAccessToken();
 
-        // handshake GraphQL over WS
+        // Handshake GraphQL over WS
         ws.send(JSON.stringify({
           type: 'connection_init',
           payload: { authorization: userToken }
         }));
 
-        // abonnement au chat du streamer (username, pas display name)
-        ws.send(JSON.stringify({
-          id: '1',
-          type: 'start',
-          payload: {
-            query: `subscription {
-              streamMessageReceived(streamer: "${CONFIG.streamerUsername}") {
-                __typename
-                type
-                id
-                content
-                sender { username displayname }
-              }
-            }`
+        // Abonnement au chat (ATTENTION: username exact du streamer)
+        const q = `subscription {
+          streamMessageReceived(streamer: "${CONFIG.streamerUsername}") {
+            __typename
+            type
+            id
+            content
+            sender { username displayname }
           }
-        }));
-        console.log('WS connected & subscribed to chat.');
+        }`;
+
+        ws.send(JSON.stringify({ id: '1', type: 'start', payload: { query: q } }));
+        console.log('WS connected. Subscription sent for streamer =', CONFIG.streamerUsername);
       } catch (e) {
         console.error('WS init error:', e.message);
-        ws.close();
+        try { ws.close(); } catch (_) {}
       }
     });
 
@@ -52,21 +49,34 @@ export function startChatListener(getValidUserAccessToken) {
       try {
         const msg = JSON.parse(raw);
 
-        // keep-alive & ack
+        // keep-alive / ack
         if (msg.type === 'ka' || msg.type === 'connection_ack') return;
         if (msg.type !== 'data') return;
 
-        const items = msg?.payload?.data?.streamMessageReceived || [];
-        for (const it of items) {
-          // On ne traite que les messages texte
+        const node = msg?.payload?.data?.streamMessageReceived;
+        if (!node) return;
+
+        // La payload peut être un objet ou un tableau selon les évènements → normalise
+        const events = Array.isArray(node) ? node : [node];
+
+        for (const it of events) {
+          // Debug minimal pour vérifier la réception
+          if (it?.__typename && it?.sender?.username) {
+            console.log(`Chat evt: ${it.__typename} from ${it.sender.username} -> ${String(it.content || '').slice(0,120)}`);
+          }
+
           if (it.__typename === 'ChatText' && typeof it.content === 'string') {
             const text = it.content.trim();
 
             // Commande !discord
             if (/^!discord\b/i.test(text)) {
-              const token = await getValidUserAccessToken();
-              await sendChatMessage(CONFIG.streamerUsername, CONFIG.botReplyText, token);
-              console.log(`Replied to !discord with: "${CONFIG.botReplyText}"`);
+              try {
+                const token = await getValidUserAccessToken();
+                await sendChatMessage(CONFIG.streamerUsername, CONFIG.botReplyText, token);
+                console.log(`Replied to !discord with: "${CONFIG.botReplyText}"`);
+              } catch (err) {
+                console.error('Failed to send chat message:', err?.message || err);
+              }
             }
           }
         }
