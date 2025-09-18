@@ -2,6 +2,7 @@ import express from 'express';
 import { CONFIG } from './config.js';
 import { buildAuthUrl, exchangeCodeForTokens, refreshAccessToken } from './auth.js';
 import { startChatListener } from './chat.js';
+import { sendChatMessage } from './graphql.js';
 
 let memoryTokens = {
   access_token: CONFIG.userAccessToken || '',
@@ -10,7 +11,8 @@ let memoryTokens = {
 
 const app = express();
 
-app.get('/', (req, res) => {
+// Page d'accueil : statut & liens
+app.get('/', (_req, res) => {
   const hasTokens = Boolean(memoryTokens.access_token && memoryTokens.refresh_token);
   res.send(`
     <h1>MrLarbin (DLive)</h1>
@@ -23,8 +25,13 @@ app.get('/', (req, res) => {
   `);
 });
 
-app.get('/auth', (req, res) => res.redirect(buildAuthUrl('mrlarbin')));
+// Optionnel: supprimer le 404 du favicon
+app.get('/favicon.ico', (_req, res) => res.status(204).end());
 
+// Démarre l’OAuth
+app.get('/auth', (_req, res) => res.redirect(buildAuthUrl('mrlarbin')));
+
+// Callback OAuth — capture tokens utilisateur
 app.get('/oauth/callback', async (req, res) => {
   const { code, error } = req.query;
   if (error) return res.status(400).send(`OAuth error: ${error}`);
@@ -38,7 +45,7 @@ app.get('/oauth/callback', async (req, res) => {
     res.send(`
       <h3>OAuth OK</h3>
       <p>Tokens reçus. Le bot peut maintenant envoyer des messages.</p>
-      <p><b>Pensez à copier ces valeurs comme variables d'environnement sur Render :</b></p>
+      <p><b>Copiez ces valeurs comme variables d'environnement sur Render :</b></p>
       <pre>DLIVE_USER_ACCESS_TOKEN=${memoryTokens.access_token}</pre>
       <pre>DLIVE_USER_REFRESH_TOKEN=${memoryTokens.refresh_token || '(none provided)'}</pre>
       <a href="/">Retour</a>
@@ -48,6 +55,7 @@ app.get('/oauth/callback', async (req, res) => {
   }
 });
 
+// Fournit un access token utilisateur valide (refresh si besoin)
 async function getValidUserAccessToken() {
   if (!memoryTokens.access_token && memoryTokens.refresh_token) {
     const d = await refreshAccessToken(memoryTokens.refresh_token);
@@ -57,8 +65,22 @@ async function getValidUserAccessToken() {
   return memoryTokens.access_token;
 }
 
+// Route de test d’envoi (debug; à retirer en prod si tu veux)
+app.get('/test-say', async (_req, res) => {
+  try {
+    const token = await getValidUserAccessToken();
+    await sendChatMessage(CONFIG.streamerUsername, CONFIG.botReplyText, token);
+    res.send('OK sent');
+  } catch (e) {
+    console.error('TEST /test-say failed:', e.message);
+    res.status(500).send('Send failed: ' + e.message);
+  }
+});
+
+// Lancement du listener WS (utilise App Token pour écouter)
 startChatListener(getValidUserAccessToken);
 
+// Serveur HTTP
 app.listen(CONFIG.port, () => {
   console.log(`MrLarbin bot running on :${CONFIG.port}`);
   console.log(`Open ${CONFIG.baseUrl}/ to configure OAuth.`);
